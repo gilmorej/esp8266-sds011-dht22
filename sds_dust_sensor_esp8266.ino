@@ -5,6 +5,7 @@
 #include <ESP8266WiFi.h>
 #include <PubSubClient.h>
 #include <WiFiManager.h>
+#include <SdsDustSensor.h>
 
 #include "Config.h"
 #include "SerialCom.h"
@@ -29,7 +30,7 @@ uint32_t statusPublishPreviousMillis = 0;
 const uint16_t statusPublishInterval = 30000; // 30 seconds = 30000 milliseconds
 
 char identifier[24];
-#define FIRMWARE_PREFIX "esp8266-vindriktning-particle-sensor"
+#define FIRMWARE_PREFIX "esp8266-sds011-particle-sensor"
 #define AVAILABILITY_ONLINE "online"
 #define AVAILABILITY_OFFLINE "offline"
 char MQTT_TOPIC_AVAILABILITY[128];
@@ -38,216 +39,309 @@ char MQTT_TOPIC_COMMAND[128];
 
 char MQTT_TOPIC_AUTOCONF_WIFI_SENSOR[128];
 char MQTT_TOPIC_AUTOCONF_PM25_SENSOR[128];
+char MQTT_TOPIC_AUTOCONF_PM10_SENSOR[128];
+char MQTT_TOPIC_AUTOCONF_TEMP_SENSOR[128];
+char MQTT_TOPIC_AUTOCONF_HUMIDITY_SENSOR[128];
+char MQTT_TOPIC_AUTOCONF_HEAT_INDEX_SENSOR[128];
+
+const int REPORTING_INTERVAL = 60000;
 
 bool shouldSaveConfig = false;
 
 void saveConfigCallback() {
-    shouldSaveConfig = true;
+  shouldSaveConfig = true;
 }
 
 void setup() {
-    Serial.begin(115200);
-    SerialCom::setup();
+  Serial.begin(115200);
+  SerialCom::setup();
 
-    Serial.println("\n");
-    Serial.println("Hello from esp8266-vindriktning-particle-sensor");
-    Serial.printf("Core Version: %s\n", ESP.getCoreVersion().c_str());
-    Serial.printf("Boot Version: %u\n", ESP.getBootVersion());
-    Serial.printf("Boot Mode: %u\n", ESP.getBootMode());
-    Serial.printf("CPU Frequency: %u MHz\n", ESP.getCpuFreqMHz());
-    Serial.printf("Reset reason: %s\n", ESP.getResetReason().c_str());
+  delay(3000);
 
-    delay(3000);
+  Serial.println("\n");
+  Serial.println("Hello from esp8266-sds011-particle-sensor");
+  Serial.printf("Core Version: %s\n", ESP.getCoreVersion().c_str());
+  Serial.printf("Boot Version: %u\n", ESP.getBootVersion());
+  Serial.printf("Boot Mode: %u\n", ESP.getBootMode());
+  Serial.printf("CPU Frequency: %u MHz\n", ESP.getCpuFreqMHz());
+  Serial.printf("Reset reason: %s\n", ESP.getResetReason().c_str());
 
-    snprintf(identifier, sizeof(identifier), "VINDRIKTNING-%X", ESP.getChipId());
-    snprintf(MQTT_TOPIC_AVAILABILITY, 127, "%s/%s/status", FIRMWARE_PREFIX, identifier);
-    snprintf(MQTT_TOPIC_STATE, 127, "%s/%s/state", FIRMWARE_PREFIX, identifier);
-    snprintf(MQTT_TOPIC_COMMAND, 127, "%s/%s/command", FIRMWARE_PREFIX, identifier);
+  delay(3000);
 
-    snprintf(MQTT_TOPIC_AUTOCONF_PM25_SENSOR, 127, "homeassistant/sensor/%s/%s_pm25/config", FIRMWARE_PREFIX, identifier);
-    snprintf(MQTT_TOPIC_AUTOCONF_WIFI_SENSOR, 127, "homeassistant/sensor/%s/%s_wifi/config", FIRMWARE_PREFIX, identifier);
+  snprintf(identifier, sizeof(identifier), "SDS011-%X", ESP.getChipId());
+  snprintf(MQTT_TOPIC_AVAILABILITY, 127, "%s/%s/status", FIRMWARE_PREFIX, identifier);
+  snprintf(MQTT_TOPIC_STATE, 127, "%s/%s/state", FIRMWARE_PREFIX, identifier);
+  snprintf(MQTT_TOPIC_COMMAND, 127, "%s/%s/command", FIRMWARE_PREFIX, identifier);
 
-    WiFi.hostname(identifier);
+  snprintf(MQTT_TOPIC_AUTOCONF_PM25_SENSOR, 127, "homeassistant/sensor/%s/%s_pm25/config", FIRMWARE_PREFIX, identifier);
+  snprintf(MQTT_TOPIC_AUTOCONF_PM10_SENSOR, 127, "homeassistant/sensor/%s/%s_pm10/config", FIRMWARE_PREFIX, identifier);
+  snprintf(MQTT_TOPIC_AUTOCONF_WIFI_SENSOR, 127, "homeassistant/sensor/%s/%s_wifi/config", FIRMWARE_PREFIX, identifier);
+  snprintf(MQTT_TOPIC_AUTOCONF_TEMP_SENSOR, 127, "homeassistant/sensor/%s/%s_temp/config", FIRMWARE_PREFIX, identifier);
+  snprintf(MQTT_TOPIC_AUTOCONF_HUMIDITY_SENSOR, 127, "homeassistant/sensor/%s/%s_humidity/config", FIRMWARE_PREFIX, identifier);
+  snprintf(MQTT_TOPIC_AUTOCONF_HEAT_INDEX_SENSOR, 127, "homeassistant/sensor/%s/%s_heatindex/config", FIRMWARE_PREFIX, identifier);
 
-    Config::load();
+  WiFi.hostname(identifier);
 
-    setupWifi();
-    setupOTA();
-    mqttClient.setServer(Config::mqtt_server, 1883);
-    mqttClient.setKeepAlive(10);
-    mqttClient.setBufferSize(2048);
-    mqttClient.setCallback(mqttCallback);
+  Config::load();
 
-    Serial.printf("Hostname: %s\n", identifier);
-    Serial.printf("IP: %s\n", WiFi.localIP().toString().c_str());
+  setupWifi();
+  setupOTA();
+  mqttClient.setServer(Config::mqtt_server, 1883);
+  mqttClient.setKeepAlive(10);
+  mqttClient.setBufferSize(4096);
+  mqttClient.setCallback(mqttCallback);
 
-    Serial.println("-- Current GPIO Configuration --");
-    Serial.printf("PIN_UART_RX: %d\n", SerialCom::PIN_UART_RX);
+  Serial.printf("Hostname: %s\n", identifier);
+  Serial.printf("IP: %s\n", WiFi.localIP().toString().c_str());
 
-    mqttReconnect();
+  Serial.println("-- Current GPIO Configuration --");
+  Serial.printf("SDS_RX_PIN: %d\n", SerialCom::SDS_RX_PIN);
+  Serial.printf("SDS_TX_PIN: %d\n", SerialCom::SDS_TX_PIN);
+
+  mqttReconnect();
 }
 
 void setupOTA() {
-    ArduinoOTA.onStart([]() { Serial.println("Start"); });
-    ArduinoOTA.onEnd([]() { Serial.println("\nEnd"); });
-    ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
-        Serial.printf("Progress: %u%%\r", (progress / (total / 100)));
-    });
-    ArduinoOTA.onError([](ota_error_t error) {
-        Serial.printf("Error[%u]: ", error);
-        if (error == OTA_AUTH_ERROR) {
-            Serial.println("Auth Failed");
-        } else if (error == OTA_BEGIN_ERROR) {
-            Serial.println("Begin Failed");
-        } else if (error == OTA_CONNECT_ERROR) {
-            Serial.println("Connect Failed");
-        } else if (error == OTA_RECEIVE_ERROR) {
-            Serial.println("Receive Failed");
-        } else if (error == OTA_END_ERROR) {
-            Serial.println("End Failed");
-        }
-    });
+  ArduinoOTA.onStart([]() {
+    Serial.println("Start");
+  });
+  ArduinoOTA.onEnd([]() {
+    Serial.println("\nEnd");
+  });
+  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+    Serial.printf("Progress: %u%%\r", (progress / (total / 100)));
+  });
+  ArduinoOTA.onError([](ota_error_t error) {
+    Serial.printf("Error[%u]: ", error);
+    if (error == OTA_AUTH_ERROR) {
+      Serial.println("Auth Failed");
+    } else if (error == OTA_BEGIN_ERROR) {
+      Serial.println("Begin Failed");
+    } else if (error == OTA_CONNECT_ERROR) {
+      Serial.println("Connect Failed");
+    } else if (error == OTA_RECEIVE_ERROR) {
+      Serial.println("Receive Failed");
+    } else if (error == OTA_END_ERROR) {
+      Serial.println("End Failed");
+    }
+  });
 
-    ArduinoOTA.setHostname(identifier);
+  ArduinoOTA.setHostname(identifier);
 
-    // This is less of a security measure and more a accidential flash prevention
-    ArduinoOTA.setPassword(identifier);
-    ArduinoOTA.begin();
+  // This is less of a security measure and more a accidential flash prevention
+  ArduinoOTA.setPassword(identifier);
+  ArduinoOTA.begin();
 }
 
 void loop() {
-    ArduinoOTA.handle();
-    SerialCom::handleUart(state);
-    mqttClient.loop();
+  ArduinoOTA.handle();
+  SerialCom::collectParticles(state);
+  SerialCom::collectTemp(state);
+  mqttClient.loop();
 
-    const uint32_t currentMillis = millis();
-    if (currentMillis - statusPublishPreviousMillis >= statusPublishInterval) {
-        statusPublishPreviousMillis = currentMillis;
+  const uint32_t currentMillis = millis();
+  if (currentMillis - statusPublishPreviousMillis >= statusPublishInterval) {
+    statusPublishPreviousMillis = currentMillis;
 
-        if (state.valid) {
-            printf("Publish state\n");
-            publishState();
-        }
+    if (state.valid) {
+      Serial.println("State is valid. Publishing.");
+      publishState();
+    } else {
+      Serial.println("State is invalid.");
     }
+  }
 
-    if (!mqttClient.connected() && currentMillis - lastMqttConnectionAttempt >= mqttConnectionInterval) {
-        lastMqttConnectionAttempt = currentMillis;
-        printf("Reconnect mqtt\n");
-        mqttReconnect();
-    }
+  if (!mqttClient.connected() && currentMillis - lastMqttConnectionAttempt >= mqttConnectionInterval) {
+    lastMqttConnectionAttempt = currentMillis;
+    printf("Reconnect mqtt...\n");
+    mqttReconnect();
+  }
+  delay(REPORTING_INTERVAL);
 }
 
 void setupWifi() {
-    wifiManager.setDebugOutput(false);
-    wifiManager.setSaveConfigCallback(saveConfigCallback);
+  wifiManager.setDebugOutput(false);
+  wifiManager.setSaveConfigCallback(saveConfigCallback);
 
-    wifiManager.addParameter(&custom_mqtt_server);
-    wifiManager.addParameter(&custom_mqtt_user);
-    wifiManager.addParameter(&custom_mqtt_pass);
+  wifiManager.addParameter(&custom_mqtt_server);
+  wifiManager.addParameter(&custom_mqtt_user);
+  wifiManager.addParameter(&custom_mqtt_pass);
 
-    WiFi.hostname(identifier);
-    wifiManager.autoConnect(identifier);
-    mqttClient.setClient(wifiClient);
+  WiFi.hostname(identifier);
+  wifiManager.autoConnect(identifier);
+  mqttClient.setClient(wifiClient);
 
-    strcpy(Config::mqtt_server, custom_mqtt_server.getValue());
-    strcpy(Config::username, custom_mqtt_user.getValue());
-    strcpy(Config::password, custom_mqtt_pass.getValue());
+  strcpy(Config::mqtt_server, custom_mqtt_server.getValue());
+  strcpy(Config::username, custom_mqtt_user.getValue());
+  strcpy(Config::password, custom_mqtt_pass.getValue());
 
-    if (shouldSaveConfig) {
-        Config::save();
-    } else {
-        // For some reason, the read values get overwritten in this function
-        // To combat this, we just reload the config
-        // This is most likely a logic error which could be fixed otherwise
-        Config::load();
-    }
+  if (shouldSaveConfig) {
+    Config::save();
+  } else {
+    // For some reason, the read values get overwritten in this function
+    // To combat this, we just reload the config
+    // This is most likely a logic error which could be fixed otherwise
+    Config::load();
+  }
 }
 
 void resetWifiSettingsAndReboot() {
-    wifiManager.resetSettings();
-    delay(3000);
-    ESP.restart();
+  wifiManager.resetSettings();
+  delay(3000);
+  ESP.restart();
 }
+
 
 void mqttReconnect() {
-    for (uint8_t attempt = 0; attempt < 3; ++attempt) {
-        if (mqttClient.connect(identifier, Config::username, Config::password, MQTT_TOPIC_AVAILABILITY, 1, true, AVAILABILITY_OFFLINE)) {
-            mqttClient.publish(MQTT_TOPIC_AVAILABILITY, AVAILABILITY_ONLINE, true);
-            publishAutoConfig();
-
-            // Make sure to subscribe after polling the status so that we never execute commands with the default data
-            mqttClient.subscribe(MQTT_TOPIC_COMMAND);
-            break;
-        }
-        delay(5000);
+  for (uint8_t attempt = 0; attempt < 3; ++attempt) {
+    if (mqttClient.connect(identifier, Config::username, Config::password, MQTT_TOPIC_AVAILABILITY, 1, true, AVAILABILITY_ONLINE)) {
+      Serial.print("Connected to MQTT Topic ");
+      Serial.println(MQTT_TOPIC_AVAILABILITY);   
+      publishAutoConfig();
+      // Make sure to subscribe after polling the status so that we never execute commands with the default data
+      mqttClient.subscribe(MQTT_TOPIC_COMMAND);
+      break;
+    } else {
+      Serial.print("Unable to connect to MQTT Topic ");
+      Serial.println(MQTT_TOPIC_AVAILABILITY);   
     }
-}
-
-bool isMqttConnected() {
-    return mqttClient.connected();
+    delay(5000);
+  }
 }
 
 void publishState() {
-    DynamicJsonDocument wifiJson(192);
-    DynamicJsonDocument stateJson(604);
-    char payload[256];
+  DynamicJsonDocument wifiJson(192);
+  DynamicJsonDocument stateJson(2048);
+  char payload[256];
 
-    wifiJson["ssid"] = WiFi.SSID();
-    wifiJson["ip"] = WiFi.localIP().toString();
-    wifiJson["rssi"] = WiFi.RSSI();
+  wifiJson["ssid"] = WiFi.SSID();
+  wifiJson["ip"] = WiFi.localIP().toString();
+  wifiJson["rssi"] = WiFi.RSSI();
 
-    stateJson["pm25"] = state.avgPM25;
+  stateJson["pm25"] = state.pm25;
+  stateJson["pm10"] = state.pm10;
+  stateJson["temp"] = state.temp;
+  stateJson["humidity"] = state.humidity;
+  stateJson["heatindex"] = state.heatIndex;
 
-    stateJson["wifi"] = wifiJson.as<JsonObject>();
+  stateJson["wifi"] = wifiJson.as<JsonObject>();
 
-    serializeJson(stateJson, payload);
-    mqttClient.publish(&MQTT_TOPIC_STATE[0], &payload[0], true);
+  Serial.println("Serializng JSON for MQTT publish...");
+  serializeJson(stateJson, payload);
+  Serial.print("Publishing: ");
+  Serial.print(payload);
+  Serial.print(" to ");
+  Serial.println(MQTT_TOPIC_STATE);
+  mqttClient.connect(identifier, Config::username, Config::password, MQTT_TOPIC_STATE, 1, true, payload, true);
+  bool success = mqttClient.publish(&MQTT_TOPIC_STATE[0], &payload[0], true);
+  Serial.print("Publish success? ");
+  if (success) {
+    Serial.println("Yes");
+  } else {
+    Serial.println("No");
+  }
 }
+
 
 void mqttCallback(char* topic, uint8_t* payload, unsigned int length) { }
 
+
 void publishAutoConfig() {
-    char mqttPayload[2048];
-    DynamicJsonDocument device(256);
-    DynamicJsonDocument autoconfPayload(1024);
-    StaticJsonDocument<64> identifiersDoc;
-    JsonArray identifiers = identifiersDoc.to<JsonArray>();
+  char mqttPayload[2048];
+  DynamicJsonDocument device(256);
+  DynamicJsonDocument autoconfPayload(1024);
+  StaticJsonDocument<64> identifiersDoc;
+  JsonArray identifiers = identifiersDoc.to<JsonArray>();
 
-    identifiers.add(identifier);
+  identifiers.add(identifier);
 
-    device["identifiers"] = identifiers;
-    device["manufacturer"] = "Ikea";
-    device["model"] = "VINDRIKTNING";
-    device["name"] = identifier;
-    device["sw_version"] = "2021.08.0";
+  device["identifiers"] = identifiers;
+  device["manufacturer"] = "Nova Fitness";
+  device["model"] = "SDS011";
+  device["name"] = identifier;
+  device["sw_version"] = "2022.01.0";
 
-    autoconfPayload["device"] = device.as<JsonObject>();
-    autoconfPayload["availability_topic"] = MQTT_TOPIC_AVAILABILITY;
-    autoconfPayload["state_topic"] = MQTT_TOPIC_STATE;
-    autoconfPayload["name"] = identifier + String(" WiFi");
-    autoconfPayload["value_template"] = "{{value_json.wifi.rssi}}";
-    autoconfPayload["unique_id"] = identifier + String("_wifi");
-    autoconfPayload["unit_of_measurement"] = "dBm";
-    autoconfPayload["json_attributes_topic"] = MQTT_TOPIC_STATE;
-    autoconfPayload["json_attributes_template"] = "{\"ssid\": \"{{value_json.wifi.ssid}}\", \"ip\": \"{{value_json.wifi.ip}}\"}";
-    autoconfPayload["icon"] = "mdi:wifi";
+  autoconfPayload["device"] = device.as<JsonObject>();
+  autoconfPayload["availability_topic"] = MQTT_TOPIC_AVAILABILITY;
+  autoconfPayload["state_topic"] = MQTT_TOPIC_STATE;
+  autoconfPayload["name"] = identifier + String(" WiFi");
+  autoconfPayload["value_template"] = "{{value_json.wifi.rssi}}";
+  autoconfPayload["unique_id"] = identifier + String("_wifi");
+  autoconfPayload["unit_of_measurement"] = "dBm";
+  autoconfPayload["json_attributes_topic"] = MQTT_TOPIC_STATE;
+  autoconfPayload["json_attributes_template"] = "{\"ssid\": \"{{value_json.wifi.ssid}}\", \"ip\": \"{{value_json.wifi.ip}}\"}";
+  autoconfPayload["icon"] = "mdi:wifi";
 
-    serializeJson(autoconfPayload, mqttPayload);
-    mqttClient.publish(&MQTT_TOPIC_AUTOCONF_WIFI_SENSOR[0], &mqttPayload[0], true);
+  serializeJson(autoconfPayload, mqttPayload);
+  mqttClient.publish(&MQTT_TOPIC_AUTOCONF_WIFI_SENSOR[0], &mqttPayload[0], true);
 
-    autoconfPayload.clear();
+  autoconfPayload.clear();
 
-    autoconfPayload["device"] = device.as<JsonObject>();
-    autoconfPayload["availability_topic"] = MQTT_TOPIC_AVAILABILITY;
-    autoconfPayload["state_topic"] = MQTT_TOPIC_STATE;
-    autoconfPayload["name"] = identifier + String(" PM 2.5");
-    autoconfPayload["unit_of_measurement"] = "μg/m³";
-    autoconfPayload["value_template"] = "{{value_json.pm25}}";
-    autoconfPayload["unique_id"] = identifier + String("_pm25");
-    autoconfPayload["icon"] = "mdi:air-filter";
+  autoconfPayload["device"] = device.as<JsonObject>();
+  autoconfPayload["availability_topic"] = MQTT_TOPIC_AVAILABILITY;
+  autoconfPayload["state_topic"] = MQTT_TOPIC_STATE;
+  autoconfPayload["name"] = identifier + String(" PM 2.5");
+  autoconfPayload["unit_of_measurement"] = "μg/m³";
+  autoconfPayload["value_template"] = "{{value_json.pm25}}";
+  autoconfPayload["unique_id"] = identifier + String("_pm25");
+  autoconfPayload["icon"] = "mdi:air-filter";
 
-    serializeJson(autoconfPayload, mqttPayload);
-    mqttClient.publish(&MQTT_TOPIC_AUTOCONF_PM25_SENSOR[0], &mqttPayload[0], true);
+  serializeJson(autoconfPayload, mqttPayload);
+  mqttClient.publish(&MQTT_TOPIC_AUTOCONF_PM25_SENSOR[0], &mqttPayload[0], true);
 
-    autoconfPayload.clear();
+  autoconfPayload.clear();
+
+  autoconfPayload["device"] = device.as<JsonObject>();
+  autoconfPayload["availability_topic"] = MQTT_TOPIC_AVAILABILITY;
+  autoconfPayload["state_topic"] = MQTT_TOPIC_STATE;
+  autoconfPayload["name"] = identifier + String(" PM 10");
+  autoconfPayload["unit_of_measurement"] = "μg/m³";
+  autoconfPayload["value_template"] = "{{value_json.pm10}}";
+  autoconfPayload["unique_id"] = identifier + String("_pm10");
+  autoconfPayload["icon"] = "mdi:air-filter";
+
+  serializeJson(autoconfPayload, mqttPayload);
+  mqttClient.publish(&MQTT_TOPIC_AUTOCONF_PM10_SENSOR[0], &mqttPayload[0], true);
+
+  autoconfPayload.clear();
+
+  autoconfPayload["device"] = device.as<JsonObject>();
+  autoconfPayload["availability_topic"] = MQTT_TOPIC_AVAILABILITY;
+  autoconfPayload["state_topic"] = MQTT_TOPIC_STATE;
+  autoconfPayload["name"] = identifier + String("Temperature");
+  autoconfPayload["unit_of_measurement"] = "°C";
+  autoconfPayload["value_template"] = "{{value_json.temp}}";
+  autoconfPayload["unique_id"] = identifier + String("_temp");
+  autoconfPayload["icon"] = "mdi:temperature-celsius";
+
+  serializeJson(autoconfPayload, mqttPayload);
+  mqttClient.publish(&MQTT_TOPIC_AUTOCONF_TEMP_SENSOR[0], &mqttPayload[0], true);
+
+  autoconfPayload.clear();
+
+  autoconfPayload["device"] = device.as<JsonObject>();
+  autoconfPayload["availability_topic"] = MQTT_TOPIC_AVAILABILITY;
+  autoconfPayload["state_topic"] = MQTT_TOPIC_STATE;
+  autoconfPayload["name"] = identifier + String("Humidity");
+  autoconfPayload["unit_of_measurement"] = "%";
+  autoconfPayload["value_template"] = "{{value_json.humidity}}";
+  autoconfPayload["unique_id"] = identifier + String("_humidity");
+  autoconfPayload["icon"] = "mdi:water-percent";
+
+  serializeJson(autoconfPayload, mqttPayload);
+  mqttClient.publish(&MQTT_TOPIC_AUTOCONF_HUMIDITY_SENSOR[0], &mqttPayload[0], true);
+
+  autoconfPayload.clear();
+
+  autoconfPayload["device"] = device.as<JsonObject>();
+  autoconfPayload["availability_topic"] = MQTT_TOPIC_AVAILABILITY;
+  autoconfPayload["state_topic"] = MQTT_TOPIC_STATE;
+  autoconfPayload["name"] = identifier + String("Heat Index");
+  autoconfPayload["unit_of_measurement"] = "°C";
+  autoconfPayload["value_template"] = "{{value_json.heatindex}}";
+  autoconfPayload["unique_id"] = identifier + String("_heatindex");
+  autoconfPayload["icon"] = "mdi:temperature-celsius";
+
+  serializeJson(autoconfPayload, mqttPayload);
+  mqttClient.publish(&MQTT_TOPIC_AUTOCONF_HEAT_INDEX_SENSOR[0], &mqttPayload[0], true);
 }
